@@ -1,3 +1,49 @@
 language: node_js
+
 node_js:
 - '0.10'
+
+services:
+- docker
+
+addons:
+  apt:
+    packages:
+    # PhantomJS 2.1.1 needs these at runtime
+    - libfontconfig1
+    - libfreetype6
+    - bzip2
+
+before_script:
+# PhantomJS 2.1.1 is WebKit 538.1 — the Safari 8 era engine 1.11.1 was released
+# against — and the only headless browser of that vintage still distributed.
+- |
+  curl -sSL -o /tmp/phantomjs.tar.bz2 \
+    https://github.com/Medium/phantomjs/releases/download/v2.1.1/phantomjs-2.1.1-linux-x86_64.tar.bz2
+  tar xjf /tmp/phantomjs.tar.bz2 -C /tmp
+  sudo ln -sf /tmp/phantomjs-2.1.1-linux-x86_64/bin/phantomjs /usr/local/bin/phantomjs
+  phantomjs --version
+# The ajax tests request test/data/*.php fixtures written for PHP 5; the image's
+# PHP 8 changes enough behaviour to fail them, so serve on a PHP 5.6 container.
+- docker run -d --name phpsrv -p 8000:8000 -v "$PWD":/app -w /app php:5.6-cli php -S 0.0.0.0:8000 -t .
+- sleep 8
+- curl -sSf -o /dev/null http://127.0.0.1:8000/test/index.html
+
+script:
+- npm test
+# One PhantomJS process per QUnit module: the whole suite in a single process
+# outlives PhantomJS 2.1.1, which segfaults partway through the ajax module.
+- |
+  failed=""
+  for m in ajax attributes callbacks core css data deferred dimensions effects \
+      event manipulation offset queue selector serialize support traversing; do
+    echo "===== QUnit module: $m ====="
+    if ! phantomjs test/qunit-runner.js "http://127.0.0.1:8000/test/index.html?module=$m"; then
+      failed="$failed $m"
+    fi
+  done
+  if [ -n "$failed" ]; then
+    echo "FAILED QUNIT MODULES:$failed"
+    exit 1
+  fi
+  echo "all QUnit modules passed"

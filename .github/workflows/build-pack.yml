@@ -1,0 +1,102 @@
+name: build-pack
+
+# Build-and-pack only: the project's test legs live in .travis.yml and run there.
+on: workflow_dispatch
+
+jobs:
+  pack:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # The published tarball carries dist/cdn/*, which upstream writes in
+      # build/release.js's makeReleaseCopies(). That function only runs under the
+      # external `jquery-release` tool (it supplies the `Release` object, shelljs
+      # and the git/svn steps), so it is unusable from CI. Reproduce exactly those
+      # copies for a final, non-pre release. It lands under build/, which
+      # .npmignore excludes, so the helper itself stays out of the tarball.
+      - name: Write the release CDN-copy step
+        run: |
+          cat > build/cdn-copies.js <<'JS'
+          var fs = require( "fs" ),
+              path = require( "path" ),
+
+              root = path.join( __dirname, ".." ),
+              version = require( path.join( root, "package.json" ) ).version,
+
+              devFile = "dist/jquery.js",
+              minFile = "dist/jquery.min.js",
+              mapFile = "dist/jquery.min.map",
+
+              cdnFolder = "dist/cdn",
+
+              releaseFiles = {
+                "jquery-VER.js": devFile,
+                "jquery-VER.min.js": minFile,
+                "jquery-VER.min.map": mapFile,
+                "jquery.js": devFile,
+                "jquery.min.js": minFile,
+                "jquery.min.map": mapFile,
+                "jquery-latest.js": devFile,
+                "jquery-latest.min.js": minFile,
+                "jquery-latest.min.map": mapFile
+              };
+
+          if ( !fs.existsSync( path.join( root, cdnFolder ) ) ) {
+            fs.mkdirSync( path.join( root, cdnFolder ) );
+          }
+
+          Object.keys( releaseFiles ).forEach(function( key ) {
+            var text,
+                builtFile = path.join( root, releaseFiles[ key ] ),
+                unpathedFile = key.replace( /VER/g, version ),
+                releaseFile = path.join( root, cdnFolder, unpathedFile );
+
+            if ( /\.map$/.test( releaseFile ) ) {
+
+              // Map files reference the new uncompressed name; all copies share a directory
+              text = fs.readFileSync( builtFile, "utf8" )
+                .replace( /"file":"([^"]+)","sources":\["([^"]+)"\]/,
+                  "\"file\":\"" + unpathedFile.replace( /\.min\.map/, ".min.js" ) +
+                  "\",\"sources\":[\"" + unpathedFile.replace( /\.min\.map/, ".js" ) + "\"]" );
+              fs.writeFileSync( releaseFile, text );
+            } else if ( /\.min\.js$/.test( releaseFile ) ) {
+
+              // The source map comment is stripped from the CDN copies
+              text = fs.readFileSync( builtFile, "utf8" )
+                .replace( /\/\/# sourceMappingURL=\S+/, "" );
+              fs.writeFileSync( releaseFile, text );
+            } else {
+              fs.writeFileSync( releaseFile, fs.readFileSync( builtFile ) );
+            }
+
+            console.log( "wrote " + cdnFolder + "/" + unpathedFile );
+          });
+          JS
+
+      # node:0.10-wheezy is the release-era runtime (1.11.1 shipped 2014-05-01) and
+      # its bundled npm 1.4 still packs the root dotfiles (.npmignore, .bowerrc,
+      # .jscsrc) that the published tarball contains and modern npm always drops.
+      # The time-machine registry freezes dependency resolution to the release
+      # date so uglify-js minifies dist/jquery.min.js byte-for-byte as published.
+      - name: Build and pack on the release-era Node/npm
+        run: |
+          set -eux
+          docker run --rm -v "$PWD":/work -w /work -e HOME=/tmp node:0.10-wheezy bash -c '
+            set -eux
+            npm config set registry https://:2014-05-01T18%3A05%3A32.863Z@time-machines-npm.sealsecurity.io/
+            npm run build
+            node build/cdn-copies.js
+            npm pack
+          '
+          sudo chown -R "$(id -u):$(id -g)" .
+          mkdir -p pack_output
+          mv jquery-*.tgz pack_output/
+          tar tzf pack_output/*.tgz | sort
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-tarball
+          path: pack_output/jquery-*.tgz
+          if-no-files-found: error
